@@ -1,4 +1,4 @@
-# 🩺 Unified Medical AI Assistant
+# 🩺 MediRAG
 
 ### RAG + Vision + Voice Powered Medical Assistant
 
