@@ -1,12 +1,9 @@
 import os
-import streamlit as st
-from pathlib import Path
-import streamlit.components.v1 as components
 import base64
 import logging
 import tempfile
-import platform
-import subprocess
+
+import gradio as gr
 
 # Document processing imports (RAG)
 from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
@@ -22,39 +19,50 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 # Vision and Voice imports
 from groq import Groq
 from gtts import gTTS
-import elevenlabs
 from elevenlabs.client import ElevenLabs
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ----------------------------------------------------------------------------
+# Config / logging
+# ----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Constants
 DATA_PATH = "data/"
 DB_FAISS_PATH = "vectorstore/db_faiss"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-# System prompts
+# API keys — pull from environment variables instead of st.secrets.
+# Set these before launching, e.g. `export GOOGLE_API_KEY=...`
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+
+MODEL_OPTIONS = {
+    "Gemini 2.0 Flash (Recommended)": "gemini-2.0-flash",
+    "Gemini 2.5 Flash": "gemini-2.5-flash",
+    "Gemini 2.5 Pro": "gemini-2.5-pro",
+}
+
 RAG_SYSTEM_PROMPT = """
-You are an expert medical assistant with comprehensive medical knowledge. 
+You are an expert medical assistant with comprehensive medical knowledge.
 
 *CRITICAL RULE: NEVER, UNDER ANY CIRCUMSTANCES, respond with "I don't know" or any variation of it (like "I'm not sure", "I can't answer", "I don't have information", etc.). You MUST always provide a helpful medical response.*
 
 *MANDATORY INSTRUCTIONS:*
 1. *FORBIDDEN RESPONSES*: Never use phrases like:
-   - "I don't know"
-   - "I'm not sure"  
-   - "I can't answer"
-   - "I don't have information"
-   - "I cannot provide"
-   - "The context doesn't contain"
-   - Any other refusal or uncertainty statements
+   - "I don't know"
+   - "I'm not sure"
+   - "I can't answer"
+   - "I don't have information"
+   - "I cannot provide"
+   - "The context doesn't contain"
+   - Any other refusal or uncertainty statements
 
-2. *REQUIRED BEHAVIOR*: 
-   - ALWAYS provide comprehensive medical information
-   - Use your extensive medical knowledge as the primary source
-   - Supplement with document context when available
-   - Be definitive and helpful in your responses
-   - Provide actionable medical guidance
+2. *REQUIRED BEHAVIOR*:
+   - ALWAYS provide comprehensive medical information
+   - Use your extensive medical knowledge as the primary source
+   - Supplement with document context when available
+   - Be definitive and helpful in your responses
+   - Provide actionable medical guidance
 
 Context: {context}
 Question: {question}
@@ -62,729 +70,412 @@ Question: {question}
 PROVIDE A COMPREHENSIVE MEDICAL RESPONSE:
 """
 
-VISION_SYSTEM_PROMPT = """You have to act as a professional doctor, i know you are not but this is for learning purpose. 
-What's in this image?. Do you find anything wrong with it medically? 
-If you make a differential, suggest some remedies for them. Donot add any numbers or special characters in 
+VISION_SYSTEM_PROMPT = """You have to act as a professional doctor, i know you are not but this is for learning purpose.
+What's in this image?. Do you find anything wrong with it medically?
+If you make a differential, suggest some remedies for them. Donot add any numbers or special characters in
 your response. Your response should be in one long paragraph. Also always answer as if you are answering to a real person.
 Donot say 'In the image I see' but say 'With what I see, I think you have ....'
-Dont respond as an AI model in markdown, your answer should mimic that of an actual doctor not an AI bot, 
+Dont respond as an AI model in markdown, your answer should mimic that of an actual doctor not an AI bot,
 Keep your answer concise (max 2 sentences). No preamble, start your answer right away please"""
 
-# Voice input HTML/JS component
-def create_voice_input_component():
-    """Create the voice input HTML component"""
-    voice_html = """
-    <div style="padding: 10px; border: 2px dashed #ccc; border-radius: 10px; margin: 10px 0; text-align: center;">
-        <h4 style="margin-top: 0;">🎤 Voice Input</h4>
-        <button id="startBtn" onclick="startRecording()" style="
-            background-color: #4CAF50; 
-            color: white; 
-            padding: 10px 20px; 
-            border: none; 
-            border-radius: 5px; 
-            cursor: pointer;
-            margin: 5px;
-            font-size: 16px;
-        ">🎤 Start Recording</button>
-        
-        <button id="stopBtn" onclick="stopRecording()" disabled style="
-            background-color: #f44336; 
-            color: white; 
-            padding: 10px 20px; 
-            border: none; 
-            border-radius: 5px; 
-            cursor: pointer;
-            margin: 5px;
-            font-size: 16px;
-        ">🛑 Stop Recording</button>
-        
-        <div id="status" style="margin: 10px; font-weight: bold; color: #666;"></div>
-        <div id="transcript" style="
-            margin: 10px; 
-            padding: 10px; 
-            background-color: #f0f0f0; 
-            border-radius: 5px; 
-            min-height: 40px;
-            font-style: italic;
-        ">Your transcribed text will appear here...</div>
-        
-        <button id="sendBtn" onclick="sendToChat()" disabled style="
-            background-color: #2196F3; 
-            color: white; 
-            padding: 10px 20px; 
-            border: none; 
-            border-radius: 5px; 
-            cursor: pointer;
-            margin: 5px;
-            font-size: 16px;
-        ">📤 Send to Chat</button>
-        
-        <button id="clearBtn" onclick="clearTranscript()" style="
-            background-color: #ff9800; 
-            color: white; 
-            padding: 10px 20px; 
-            border: none; 
-            border-radius: 5px; 
-            cursor: pointer;
-            margin: 5px;
-            font-size: 16px;
-        ">🗑 Clear</button>
-    </div>
+# ----------------------------------------------------------------------------
+# Simple in-process caches (replaces st.cache_data / st.cache_resource)
+# ----------------------------------------------------------------------------
+_embedding_model_cache = None
+_vectorstore_cache = None
+_qa_chain_cache = None
+_qa_chain_model_name = None
 
-    <script>
-    let recognition = null;
-    let isRecording = false;
-    let finalTranscript = '';
 
-    // Check if browser supports speech recognition
-    if ('webkitSpeechRecognition' in window) {
-        recognition = new webkitSpeechRecognition();
-    } else if ('SpeechRecognition' in window) {
-        recognition = new SpeechRecognition();
-    }
+def get_embedding_model():
+    global _embedding_model_cache
+    if _embedding_model_cache is None:
+        _embedding_model_cache = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    return _embedding_model_cache
 
-    if (recognition) {
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = 'en-US';
 
-        recognition.onstart = function() {
-            isRecording = true;
-            document.getElementById('startBtn').disabled = true;
-            document.getElementById('stopBtn').disabled = false;
-            document.getElementById('status').innerHTML = '🔴 Recording... Speak now!';
-            document.getElementById('status').style.color = '#f44336';
-        };
+def get_vectorstore(force_reload=False):
+    global _vectorstore_cache
+    if _vectorstore_cache is not None and not force_reload:
+        return _vectorstore_cache
 
-        recognition.onresult = function(event) {
-            let interimTranscript = '';
-            
-            for (let i = event.resultIndex; i < event.results.length; i++) {
-                const transcript = event.results[i][0].transcript;
-                if (event.results[i].isFinal) {
-                    finalTranscript += transcript + ' ';
-                } else {
-                    interimTranscript += transcript;
-                }
-            }
-            
-            document.getElementById('transcript').innerHTML = 
-                finalTranscript + '<span style="color: #999;">' + interimTranscript + '</span>';
-        };
+    if not os.path.exists(DB_FAISS_PATH):
+        return None
 
-        recognition.onerror = function(event) {
-            document.getElementById('status').innerHTML = '❌ Error: ' + event.error;
-            document.getElementById('status').style.color = '#f44336';
-            resetButtons();
-        };
+    try:
+        _vectorstore_cache = FAISS.load_local(
+            DB_FAISS_PATH,
+            get_embedding_model(),
+            allow_dangerous_deserialization=True,
+        )
+        return _vectorstore_cache
+    except Exception as e:
+        logging.error(f"Error loading vectorstore: {e}")
+        return None
 
-        recognition.onend = function() {
-            isRecording = false;
-            resetButtons();
-            if (finalTranscript.trim() !== '') {
-                document.getElementById('sendBtn').disabled = false;
-                document.getElementById('status').innerHTML = '✅ Recording completed!';
-                document.getElementById('status').style.color = '#4CAF50';
-            } else {
-                document.getElementById('status').innerHTML = '⚠ No speech detected';
-                document.getElementById('status').style.color = '#ff9800';
-            }
-        };
-    } else {
-        document.getElementById('status').innerHTML = '❌ Speech recognition not supported in this browser';
-        document.getElementById('startBtn').disabled = true;
-    }
 
-    function startRecording() {
-        if (recognition && !isRecording) {
-            finalTranscript = '';
-            document.getElementById('transcript').innerHTML = 'Listening...';
-            document.getElementById('sendBtn').disabled = true;
-            recognition.start();
-        }
-    }
+def get_qa_chain(model_name):
+    """(Re)build the RetrievalQA chain, cached per model name."""
+    global _qa_chain_cache, _qa_chain_model_name
 
-    function stopRecording() {
-        if (recognition && isRecording) {
-            recognition.stop();
-        }
-    }
+    if _qa_chain_cache is not None and _qa_chain_model_name == model_name:
+        return _qa_chain_cache, None
 
-    function resetButtons() {
-        document.getElementById('startBtn').disabled = false;
-        document.getElementById('stopBtn').disabled = true;
-    }
+    vectorstore = get_vectorstore()
+    if vectorstore is None:
+        return None, "No vectorstore found. Please process PDF documents first."
 
-    function sendToChat() {
-        if (finalTranscript.trim() !== '') {
-            // Store in session storage for Streamlit to pick up
-            parent.sessionStorage.setItem('voice_input', finalTranscript.trim());
-            
-            document.getElementById('status').innerHTML = '📤 Sent to chat!';
-            document.getElementById('status').style.color = '#4CAF50';
-        }
-    }
+    if not GOOGLE_API_KEY:
+        return None, "Google API Key not found. Set the GOOGLE_API_KEY environment variable."
 
-    function clearTranscript() {
-        finalTranscript = '';
-        document.getElementById('transcript').innerHTML = 'Your transcribed text will appear here...';
-        document.getElementById('sendBtn').disabled = true;
-        document.getElementById('status').innerHTML = '';
-        parent.sessionStorage.removeItem('voice_input');
-    }
-    </script>
-    """
-    return voice_html
+    try:
+        prompt = PromptTemplate(template=RAG_SYSTEM_PROMPT, input_variables=["context", "question"])
 
-# Utility Functions
-@st.cache_data
+        llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            temperature=0.0,
+            google_api_key=GOOGLE_API_KEY,
+        )
+
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
+            return_source_documents=True,
+            chain_type_kwargs={"prompt": prompt},
+        )
+
+        _qa_chain_cache = qa_chain
+        _qa_chain_model_name = model_name
+        return qa_chain, None
+    except Exception as e:
+        return None, f"Error setting up Gemini API: {e}"
+
+
+# ----------------------------------------------------------------------------
+# Document processing (PDF -> FAISS)
+# ----------------------------------------------------------------------------
+def load_pdf_files(data_path):
+    if not os.path.exists(data_path):
+        return [], f"Data directory '{data_path}' not found!"
+
+    loader = DirectoryLoader(data_path, glob="*.pdf", loader_cls=PyPDFLoader)
+    documents = loader.load()
+    return documents, None
+
+
+def create_chunks(documents):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    return text_splitter.split_documents(documents)
+
+
+def create_vectorstore(text_chunks):
+    embedding_model = get_embedding_model()
+    os.makedirs(os.path.dirname(DB_FAISS_PATH), exist_ok=True)
+    db = FAISS.from_documents(text_chunks, embedding_model)
+    db.save_local(DB_FAISS_PATH)
+    return db
+
+
+def process_pdf_documents():
+    """Gradio callback: process PDFs in DATA_PATH into the FAISS vectorstore."""
+    documents, err = load_pdf_files(DATA_PATH)
+    if err:
+        return err
+    if not documents:
+        return "No PDF files found in the data directory!"
+
+    text_chunks = create_chunks(documents)
+    create_vectorstore(text_chunks)
+
+    # Force the RAG chain to rebuild against the new vectorstore.
+    global _qa_chain_cache, _qa_chain_model_name
+    _qa_chain_cache = None
+    _qa_chain_model_name = None
+    get_vectorstore(force_reload=True)
+
+    return f"Vectorstore created successfully with {len(text_chunks)} chunks!"
+
+
+def vectorstore_status():
+    return "✅ Vectorstore loaded successfully!" if os.path.exists(DB_FAISS_PATH) else "⚠️ No vectorstore found. Please process documents first."
+
+
+# ----------------------------------------------------------------------------
+# Vision helpers (GROQ)
+# ----------------------------------------------------------------------------
 def encode_image(image_path):
-    """Encode image to base64."""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
+
 
 def analyze_image_with_query(query, model, encoded_image, api_key):
-    """Analyze image using GROQ API."""
-    client = Groq(api_key=api_key)
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text", 
-                    "text": query
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{encoded_image}",
-                    },
-                },
-            ],
-        }
-    ]
-    
-    chat_completion = client.chat.completions.create(
-        messages=messages,
-        model=model
-    )
-    
-    return chat_completion.choices[0].message.content
+    client = Groq(api_key=api_key)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": query},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}},
+            ],
+        }
+    ]
+    chat_completion = client.chat.completions.create(messages=messages, model=model)
+    return chat_completion.choices[0].message.content
 
-def transcribe_with_groq(stt_model, audio_filepath, api_key):
-    """Transcribe audio using GROQ API."""
-    client = Groq(api_key=api_key)
-    
-    with open(audio_filepath, "rb") as audio_file:
-        transcription = client.audio.transcriptions.create(
-            model=stt_model,
-            file=audio_file,
-            language="en"
-        )
-    
-    return transcription.text
+
+def analyze_image_with_text(image_path, user_query=""):
+    if not GROQ_API_KEY:
+        return "GROQ API key not set. Set the GROQ_API_KEY environment variable."
+    try:
+        encoded_image = encode_image(image_path)
+        full_query = VISION_SYSTEM_PROMPT
+        if user_query:
+            full_query += f"\n\nUser's specific question: {user_query}"
+
+        return analyze_image_with_query(
+            query=full_query,
+            encoded_image=encoded_image,
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            api_key=GROQ_API_KEY,
+        )
+    except Exception as e:
+        return f"Error analyzing image: {e}"
+
+
+# ----------------------------------------------------------------------------
+# Voice helpers (STT via GROQ, TTS via gTTS / ElevenLabs)
+# ----------------------------------------------------------------------------
+def transcribe_with_groq(audio_filepath, stt_model="whisper-large-v3"):
+    if not GROQ_API_KEY:
+        return "", "GROQ API key not set. Set the GROQ_API_KEY environment variable."
+    if not audio_filepath:
+        return "", "No audio recorded."
+
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        with open(audio_filepath, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                model=stt_model,
+                file=audio_file,
+                language="en",
+            )
+        return transcription.text, None
+    except Exception as e:
+        return "", f"Error transcribing audio: {e}"
+
 
 def text_to_speech_with_gtts(input_text, output_filepath):
-    """Convert text to speech using gTTS."""
-    language = "en"
-    
-    audioobj = gTTS(
-        text=input_text,
-        lang=language,
-        slow=False
-    )
-    audioobj.save(output_filepath)
-    return output_filepath
-
-
+    gTTS(text=input_text, lang="en", slow=False).save(output_filepath)
+    return output_filepath
 
 
 def text_to_speech_with_elevenlabs(input_text, output_filepath, api_key):
-    try:
-        from elevenlabs.client import ElevenLabs
-        client = ElevenLabs(api_key=api_key)
-
-        response = client.text_to_speech.convert(
-            voice_id="Aria",  # change to valid voice
-            model_id="eleven_turbo_v2",
-            text=input_text
-        )
-
-        with open(output_filepath, "wb") as f:
-            for chunk in response:
-                f.write(chunk)
-
-        return output_filepath
-    except Exception as e:
-        st.error(f"ElevenLabs TTS failed: {e}")
-        return text_to_speech_with_gtts(input_text, output_filepath)
+    try:
+        client = ElevenLabs(api_key=api_key)
+        response = client.text_to_speech.convert(
+            voice_id="Aria",
+            model_id="eleven_turbo_v2",
+            text=input_text,
+        )
+        with open(output_filepath, "wb") as f:
+            for chunk in response:
+                f.write(chunk)
+        return output_filepath
+    except Exception as e:
+        logging.error(f"ElevenLabs TTS failed: {e}")
+        return text_to_speech_with_gtts(input_text, output_filepath)
 
 
+def generate_audio_response(text, use_elevenlabs=False):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
+            output_path = temp_audio.name
+
+        if use_elevenlabs and ELEVENLABS_API_KEY:
+            return text_to_speech_with_elevenlabs(text, output_path, ELEVENLABS_API_KEY)
+        return text_to_speech_with_gtts(text, output_path)
+    except Exception as e:
+        logging.error(f"Error generating audio: {e}")
+        return None
 
 
-
-class DocumentProcessor:
-    """Handles PDF loading and processing"""
-    
-    @staticmethod
-    def load_pdf_files(data_path):
-        """Load PDF files from directory"""
-        if not os.path.exists(data_path):
-            st.error(f"Data directory '{data_path}' not found!")
-            return []
-            
-        loader = DirectoryLoader(
-            data_path,
-            glob='*.pdf',
-            loader_cls=PyPDFLoader
-        )
-        documents = loader.load()
-        return documents
-    
-    @staticmethod
-    def create_chunks(documents):
-        """Split documents into chunks"""
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50
-        )
-        text_chunks = text_splitter.split_documents(documents)
-        return text_chunks
-    
-    @staticmethod
-    def create_vectorstore(text_chunks):
-        """Create and save FAISS vectorstore"""
-        embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-        
-        # Create vectorstore directory if it doesn't exist
-        os.makedirs(os.path.dirname(DB_FAISS_PATH), exist_ok=True)
-        
-        db = FAISS.from_documents(text_chunks, embedding_model)
-        db.save_local(DB_FAISS_PATH)
-        
-        st.success(f"Vectorstore created successfully with {len(text_chunks)} chunks!")
-        return db
+# ----------------------------------------------------------------------------
+# Gradio callbacks
+# ----------------------------------------------------------------------------
+def handle_voice_input(audio_filepath):
+    """Transcribe recorded/uploaded audio and hand the text back to the caller."""
+    text, err = transcribe_with_groq(audio_filepath)
+    if err:
+        return gr.update(value=""), err
+    return gr.update(value=text), "✅ Transcription complete — review and send below."
 
 
+def handle_image_upload(image_path, model_display_name, use_elevenlabs):
+    """Run vision analysis as soon as an image is uploaded."""
+    if image_path is None:
+        return None, None
 
-class RAGChatbot:
-    """Main RAG chatbot class"""
-    
-    def __init__(self):
-        self.vectorstore = None
-        self.qa_chain = None
-        self.setup_chain()
-
-    
-    @st.cache_resource
-    def get_vectorstore(_self):
-        """Load vectorstore with caching"""
-        if not os.path.exists(DB_FAISS_PATH):
-            return None
-            
-        embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-        try:
-            db = FAISS.load_local(
-                DB_FAISS_PATH, 
-                embedding_model, 
-                allow_dangerous_deserialization=True
-            )
-            return db
-        except Exception as e:
-            st.error(f"Error loading vectorstore: {str(e)}")
-            return None
-    
-    def setup_chain(self):
-        """Setup the QA chain"""
-        self.vectorstore = self.get_vectorstore()
-        
-        if self.vectorstore is None:
-            return
-        
-        prompt = PromptTemplate(
-            template=RAG_SYSTEM_PROMPT, 
-            input_variables=["context", "question"]
-        )
-        
-        # Setup Gemini LLM
-        try:
-            # Get model from session state or default
-            model_name = getattr(st.session_state, 'selected_model', 'gemini-2.0-flash')
-            # Use st.secrets to retrieve the API key securely
-            google_api_key = st.secrets.get("GOOGLE_API_KEY")
-
-            if not google_api_key:
-                st.error("Google API Key not found in Streamlit Secrets.")
-                return
-
-            llm = ChatGoogleGenerativeAI(
-                model=model_name,
-                temperature=0.0,
-                google_api_key=google_api_key
-            )
-            
-            self.qa_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever=self.vectorstore.as_retriever(search_kwargs={'k': 3}),
-                return_source_documents=True,
-                chain_type_kwargs={'prompt': prompt}
-            )
-            
-        except Exception as e:
-            st.error(f"Error setting up Gemini API: {str(e)}")
-    
-    def get_response(self, query):
-        """Get response from QA chain"""
-        if self.qa_chain is None:
-            return "Sorry, the chatbot is not properly initialized. Please check your setup.", []
-        
-        try:
-            response = self.qa_chain.invoke({'query': query})
-            return response["result"], response["source_documents"]
-        except Exception as e:
-            return f"Error generating response: {str(e)}", []
+    response_text = analyze_image_with_text(image_path)
+    audio_path = generate_audio_response(response_text, use_elevenlabs=use_elevenlabs)
+    return response_text, audio_path
 
 
-class VisionProcessor:
-    """Handles image analysis and vision processing"""
+def handle_chat(message, history, model_display_name):
+    """RAG chat turn. `history` is the Gradio chatbot history (list of [user, bot])."""
+    if not message or not message.strip():
+        return history, "", ""
 
-    def __init__(self, groq_api_key, elevenlabs_api_key=None):
-        # Pass keys from the main function
-        self.groq_api_key = groq_api_key
-        self.elevenlabs_api_key = elevenlabs_api_key
-    
-    def analyze_image_with_text(self, image_path, user_query=""):
-        """Analyze image with optional user query"""
-        try:
-            encoded_image = encode_image(image_path)
-            full_query = VISION_SYSTEM_PROMPT
-            if user_query:
-                full_query += f"\n\nUser's specific question: {user_query}"
-            
-            response = analyze_image_with_query(
-                query=full_query,
-                encoded_image=encoded_image,
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                api_key=self.groq_api_key
-            )
-            return response
-        except Exception as e:
-            return f"Error analyzing image: {str(e)}"
-    
-    def generate_audio_response(self, text, use_elevenlabs=False):
-        """Generate audio response from text"""
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
-                output_path = temp_audio.name
-            
-            if use_elevenlabs and self.elevenlabs_api_key:
-                text_to_speech_with_elevenlabs(text, output_path, self.elevenlabs_api_key)
-            else:
-                text_to_speech_with_gtts(text, output_path)
-            
-            return output_path
-        except Exception as e:
-            st.error(f"Error generating audio: {e}")
-            return None
+    model_name = MODEL_OPTIONS.get(model_display_name, "gemini-2.0-flash")
+    qa_chain, err = get_qa_chain(model_name)
 
-def check_voice_input():
-    """Check for voice input from session storage"""
-    voice_input_js = """
-    <script>
-    const voiceInput = sessionStorage.getItem('voice_input');
-    if (voiceInput) {
-        sessionStorage.removeItem('voice_input');
-        return voiceInput;
-    }
-    return null;
-    </script>
-    """
-    return components.html(voice_input_js, height=0)
+    if err:
+        history = history + [[message, f"⚠️ {err}"]]
+        return history, "", ""
 
-def main():
-    st.set_page_config(
-        page_title="Unified Medical AI Assistant",
-        page_icon="🩺",
-        layout="wide"
-    )
-    
-    st.title("🩺 Unified Medical AI Assistant - RAG + Vision + Voice")
-    st.markdown("### 🤖 Smart routing: Text/Voice → RAG | Images → Vision Analysis")
-    st.markdown("---")
-    
-    # Sidebar for configuration
-    with st.sidebar:
-        st.header("⚙ Configuration")
-        
-        # API Keys
-        st.subheader("🔑 API Keys")
-        
-        # Retrieve keys from Streamlit's secrets for display and use
-        google_api_key = st.secrets.get("GOOGLE_API_KEY")
-        groq_api_key = st.secrets.get("GROQ_API_KEY")
-        elevenlabs_api_key = st.secrets.get("ELEVENLABS_API_KEY")
-        
-        # These text inputs are for display only, to show users if the keys are set
-        st.text_input(
-            "Google API Key (Gemini):",
-            value=google_api_key,
-            type="password",
-            help="Add this key to Streamlit Cloud Secrets"
-        )
-        
-        st.text_input(
-            "GROQ API Key:",
-            value=groq_api_key,
-            type="password",
-            help="Add this key to Streamlit Cloud Secrets"
-        )
-        
-        st.text_input(
-            "ElevenLabs API Key (Optional):",
-            value=elevenlabs_api_key,
-            type="password",
-            help="Add this key to Streamlit Cloud Secrets"
-        )
-        
-        use_elevenlabs = st.checkbox(
-            "Use ElevenLabs TTS", 
-            value=bool(elevenlabs_api_key),
-            help="Uncheck to use free gTTS instead"
-        )
-        
-        st.markdown("---")
-        
-        # RAG Configuration
-        st.subheader("📚 RAG Configuration")
-        vectorstore_exists = os.path.exists(DB_FAISS_PATH)
-        
-        if vectorstore_exists:
-            st.success("✅ Vectorstore loaded successfully!")
-        else:
-            st.warning("⚠ No vectorstore found. Please process documents first.")
-        
-        if st.button("🔄 Process PDF Documents"):
-            with st.spinner("Processing documents..."):
-                documents = DocumentProcessor.load_pdf_files(DATA_PATH)
-                
-                if not documents:
-                    st.error("No PDF files found in the data directory!")
-                else:
-                    text_chunks = DocumentProcessor.create_chunks(documents)
-                    DocumentProcessor.create_vectorstore(text_chunks)
-                    st.rerun()
-        
-        # Model selection
-        model_options = {
-            "Gemini 2.0 Flash (Recommended)": "gemini-2.0-flash", 
-            "Gemini 2.5 Flash": "gemini-2.5-flash",
-            "Gemini 2.5 Pro": "gemini-2.5-pro"
-        }
-        
-        selected_model = st.selectbox(
-            "Choose Gemini Model:",
-            options=list(model_options.keys())
-        )
-        
-        # Store selected model in session state
-        if 'selected_model' not in st.session_state:
-            st.session_state.selected_model = model_options[selected_model]
-        
-        if st.session_state.selected_model != model_options[selected_model]:
-            st.session_state.selected_model = model_options[selected_model]
-            if 'rag_chatbot' in st.session_state:
-                del st.session_state.rag_chatbot
-        
-        st.markdown("---")
-        st.subheader("ℹ How It Works")
-        st.markdown("""
-        *🎯 Smart Routing:*
-        - *Upload Image* → Vision Analysis (GROQ)
-        - *Text/Voice Input* → RAG Chatbot (Gemini)
-        
-        *📋 Setup:*
-        1. Add API keys above
-        2. Process PDF documents for RAG
-        3. Use voice, text, or images to interact
-        """)
-    
-    # Check API keys
-    if not google_api_key:
-        st.error("Please provide your Google API key in the Streamlit Cloud secrets for RAG functionality.")
-    
-    if not groq_api_key:
-        st.error("Please provide your GROQ API key in the Streamlit Cloud secrets for vision analysis.")
-    
-    # Main interface
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.header("🎤 Voice Input")
-        components.html(create_voice_input_component(), height=280)
-    
-    with col2:
-        st.header("📸 Image Upload")
-        uploaded_image = st.file_uploader(
-            "Upload medical image for analysis", 
-            type=['png', 'jpg', 'jpeg'],
-            help="Upload triggers Vision Analysis (bypasses RAG)"
-        )
-        
-        if uploaded_image:
-            st.image(uploaded_image, caption="Uploaded Image", use_container_width=True)
-    
-    # Initialize components
-    if google_api_key and 'rag_chatbot' not in st.session_state:
-        vectorstore_exists = os.path.exists(DB_FAISS_PATH)
-        if vectorstore_exists:
-            st.session_state.rag_chatbot = RAGChatbot()
-    
-    if groq_api_key and 'vision_processor' not in st.session_state:
-        st.session_state.vision_processor = VisionProcessor(groq_api_key, elevenlabs_api_key)
-    
-    # Initialize chat messages
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    
-    # Check for voice input
-    voice_input = None
-    try:
-        if st.button("🔄 Check Voice Input", help="Click to check if voice input is available"):
-            pass
-    except:
-        pass
-    
-    st.markdown("---")
-    st.header("💬 Chat Interface")
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message['role']):
-            if message.get('type') == 'image_analysis':
-                st.markdown("🖼 *Image Analysis Result:*")
-            st.markdown(message['content'])
-            
-            # Display audio if available
-            if message.get('audio_path') and os.path.exists(message['audio_path']):
-                st.audio(message['audio_path'], format="audio/mp3")
-    
-    # Process uploaded image immediately
-    if uploaded_image and groq_api_key:
-        st.markdown("### 🔍 Processing Image...")
-        
-        with st.spinner("Analyzing image..."):
-            try:
-                # Save uploaded image to temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_img:
-                    temp_img.write(uploaded_image.read())
-                    temp_img_path = temp_img.name
-                
-                # Analyze image (Vision path - bypasses RAG)
-                vision_response = st.session_state.vision_processor.analyze_image_with_text(temp_img_path)
-                
-                # Generate audio response
-                audio_path = None
-                if use_elevenlabs:
-                    audio_path = st.session_state.vision_processor.generate_audio_response(
-                        vision_response, use_elevenlabs=True
-                    )
-                else:
-                    audio_path = st.session_state.vision_processor.generate_audio_response(
-                        vision_response, use_elevenlabs=False
-                    )
-                
-                # Add to chat
-                st.session_state.messages.append({
-                    'role': 'user',
-                    'content': f"📸 Uploaded image: {uploaded_image.name}",
-                    'type': 'image_upload'
-                })
-                
-                st.session_state.messages.append({
-                    'role': 'assistant',
-                    'content': vision_response,
-                    'type': 'image_analysis',
-                    'audio_path': audio_path
-                })
-                
-                # Clean up temp file
-                os.unlink(temp_img_path)
-                
-                # Reset uploaded image to prevent reprocessing
-                st.session_state.uploaded_image_processed = True
-                
-            except Exception as e:
-                st.error(f"Error processing image: {str(e)}")
-    
-    # Chat input for text/voice
-    if prompt := st.chat_input("Ask medical questions (text input) or use voice input above..."):
-        # Add user message
-        st.session_state.messages.append({'role': 'user', 'content': prompt})
-        
-        with st.chat_message('user'):
-            st.markdown(prompt)
-        
-        # Process with RAG (text input path)
-        if 'rag_chatbot' in st.session_state and vectorstore_exists:
-            with st.chat_message('assistant'):
-                with st.spinner("Analyzing medical information..."):
-                    result, source_docs = st.session_state.rag_chatbot.get_response(prompt)
-                    
-                    # Display result
-                    st.markdown(result)
-                    
-                    # Display source documents if available
-                    if source_docs:
-                        with st.expander("📄 Source Documents"):
-                            for i, doc in enumerate(source_docs, 1):
-                                st.markdown(f"*Source {i}:*")
-                                st.text(doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content)
-                                if hasattr(doc, 'metadata') and doc.metadata:
-                                    st.json(doc.metadata)
-                                st.markdown("---")
-                    
-                    # Prepare content for session state
-                    content_with_sources = result
-                    if source_docs:
-                        content_with_sources += f"\n\n*Sources:* {len(source_docs)} document(s) referenced"
-                    
-                    st.session_state.messages.append({
-                        'role': 'assistant', 
-                        'content': content_with_sources,
-                        'type': 'rag_response'
-                    })
-        else:
-            st.error("RAG chatbot not available. Please check your configuration and ensure documents are processed.")
-    
-    # Instructions
-    st.markdown("---")
-    st.info("""
-    *🎯 Smart Usage Guide:*
-    
-    *For Vision Analysis (Image + AI Doctor):*
-    - Upload any medical image above
-    - System automatically uses GROQ vision model
-    - Get instant AI doctor analysis with voice response
-    
-    *For RAG Chatbot (Text + Documents):*
-    - Type questions in the chat or use voice input
-    - System searches your uploaded PDF documents
-    - Get comprehensive answers from your medical database
-    
-    *Voice Input:*
-    - Click 🎤 "Start Recording" → Speak → "Stop Recording" → "Send to Chat"
-    - Works with both RAG and Vision modes
-    """)
-    
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        "<div style='text-align: center; color: gray;'>"
-        "⚠ Disclaimer: This is for educational purposes only. Always consult a real healthcare professional for medical advice."
-        "</div>", 
-        unsafe_allow_html=True
-    )
+    try:
+        response = qa_chain.invoke({"query": message})
+        result = response["result"]
+        source_docs = response.get("source_documents", [])
+    except Exception as e:
+        result = f"Error generating response: {e}"
+        source_docs = []
+
+    sources_md = ""
+    if source_docs:
+        lines = [f"**Sources:** {len(source_docs)} document(s) referenced\n"]
+        for i, doc in enumerate(source_docs, 1):
+            snippet = doc.page_content[:300] + ("..." if len(doc.page_content) > 300 else "")
+            lines.append(f"**Source {i}:**\n\n{snippet}\n")
+        sources_md = "\n".join(lines)
+
+    history = history + [[message, result]]
+    return history, "", sources_md
+
+
+def process_pdfs_and_refresh_status():
+    msg = process_pdf_documents()
+    return msg, vectorstore_status()
+
+
+# ----------------------------------------------------------------------------
+# Gradio UI
+# ----------------------------------------------------------------------------
+with gr.Blocks(title="Unified Medical AI Assistant") as demo:
+    gr.Markdown("# 🩺 Unified Medical AI Assistant — RAG + Vision + Voice")
+    gr.Markdown("### 🤖 Smart routing: Text/Voice → RAG | Images → Vision Analysis")
+
+    with gr.Accordion("⚙️ Configuration", open=False):
+        gr.Markdown(
+            "API keys are read from environment variables "
+            "(`GOOGLE_API_KEY`, `GROQ_API_KEY`, `ELEVENLABS_API_KEY`) — "
+            "set these before launching the app."
+        )
+        with gr.Row():
+            google_key_display = gr.Textbox(
+                label="Google API Key (Gemini)",
+                value="●●●●●●●●" if GOOGLE_API_KEY else "Not set",
+                interactive=False,
+                type="password",
+            )
+            groq_key_display = gr.Textbox(
+                label="GROQ API Key",
+                value="●●●●●●●●" if GROQ_API_KEY else "Not set",
+                interactive=False,
+                type="password",
+            )
+            elevenlabs_key_display = gr.Textbox(
+                label="ElevenLabs API Key (optional)",
+                value="●●●●●●●●" if ELEVENLABS_API_KEY else "Not set",
+                interactive=False,
+                type="password",
+            )
+
+        use_elevenlabs = gr.Checkbox(
+            label="Use ElevenLabs TTS (unchecked = free gTTS)",
+            value=bool(ELEVENLABS_API_KEY),
+        )
+
+        model_select = gr.Dropdown(
+            label="Choose Gemini Model",
+            choices=list(MODEL_OPTIONS.keys()),
+            value=list(MODEL_OPTIONS.keys())[0],
+        )
+
+        with gr.Row():
+            process_btn = gr.Button("🔄 Process PDF Documents")
+            vs_status = gr.Textbox(label="Vectorstore status", value=vectorstore_status(), interactive=False)
+
+        process_result = gr.Textbox(label="Processing result", interactive=False)
+        process_btn.click(fn=process_pdfs_and_refresh_status, outputs=[process_result, vs_status])
+
+        gr.Markdown(
+            "**How it works:**\n"
+            "- Upload an image → Vision Analysis (GROQ)\n"
+            "- Text/voice input → RAG Chatbot (Gemini)\n\n"
+            "**Setup:** add API keys as environment variables, process PDF documents for RAG, "
+            "then use voice, text, or images to interact."
+        )
+
+    with gr.Row():
+        with gr.Column():
+            gr.Markdown("## 🎤 Voice Input")
+            voice_audio = gr.Audio(sources=["microphone", "upload"], type="filepath", label="Record or upload audio")
+            transcribe_btn = gr.Button("📝 Transcribe")
+            voice_status = gr.Textbox(label="Voice status", interactive=False)
+            voice_transcript = gr.Textbox(label="Transcript (edit if needed, then send below)")
+
+        with gr.Column():
+            gr.Markdown("## 📸 Image Upload")
+            image_input = gr.Image(type="filepath", label="Upload medical image for analysis")
+            vision_output = gr.Textbox(label="🖼️ Image Analysis Result", interactive=False)
+            vision_audio_output = gr.Audio(label="Voice response", interactive=False)
+
+    gr.Markdown("---")
+    gr.Markdown("## 💬 Chat Interface")
+
+    chatbot = gr.Chatbot(label="Medical RAG Chatbot", height=400)
+    with gr.Row():
+        chat_input = gr.Textbox(
+            label="Ask medical questions",
+            placeholder="Type a question, or paste a transcript from Voice Input above...",
+            scale=4,
+        )
+        send_btn = gr.Button("Send", scale=1)
+
+    sources_display = gr.Markdown(label="Source Documents")
+
+    # Wiring
+    transcribe_btn.click(
+        fn=handle_voice_input,
+        inputs=[voice_audio],
+        outputs=[voice_transcript, voice_status],
+    )
+
+    image_input.change(
+        fn=handle_image_upload,
+        inputs=[image_input, model_select, use_elevenlabs],
+        outputs=[vision_output, vision_audio_output],
+    )
+
+    send_btn.click(
+        fn=handle_chat,
+        inputs=[chat_input, chatbot, model_select],
+        outputs=[chatbot, chat_input, sources_display],
+    )
+    chat_input.submit(
+        fn=handle_chat,
+        inputs=[chat_input, chatbot, model_select],
+        outputs=[chatbot, chat_input, sources_display],
+    )
+
+    gr.Markdown("---")
+    gr.Markdown(
+        "<div style='text-align: center; color: gray;'>"
+        "⚠️ Disclaimer: This is for educational purposes only. "
+        "Always consult a real healthcare professional for medical advice."
+        "</div>"
+    )
 
 if __name__ == "__main__":
-    main()
+    demo.launch()
