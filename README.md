@@ -1,4 +1,8 @@
 # 🩺 MediRAG
+<img width="948" height="459" alt="Screenshot 2026-08-18 210021" src="https://github.com/user-attachments/assets/4fc8ab64-bab2-4ff2-a578-340bc1a1e528" />
+<img width="1243" height="694" alt="Screenshot 2026-08-18 210032" src="https://github.com/user-attachments/assets/423a86ce-f842-43a6-a57d-2fe50772b69b" />
+<img width="1289" height="690" alt="Screenshot 2026-08-18 210045" src="https://github.com/user-attachments/assets/366a7b0c-4a37-4010-b74c-191c56eb9f2e" />
+<img width="679" height="489" alt="image" src="https://github.com/user-attachments/assets/ade5de2a-db33-4efe-8a3f-58e6ea17587e" />
 
 ### RAG + Vision + Voice Powered Medical Assistant
 
